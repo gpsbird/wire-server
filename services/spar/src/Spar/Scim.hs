@@ -108,8 +108,27 @@ apiScim = hoistScim (toServant (Scim.siteServer configuration))
      :<|> apiScimToken
   where
     hoistScim = hoistServer (Proxy @(Scim.SiteAPI ScimToken))
-                            (Scim.fromScimHandler fromError)
-    fromError = throwError . SAML.CustomServant . Scim.scimToServantErr
+                            (wrapScimErrors . toSpar)
+    -- Unwrap the 'ScimHandler'
+    toSpar :: Scim.ScimHandler Spar a -> Spar a
+    toSpar = Scim.fromScimHandler
+             (throwError . SAML.CustomServant . Scim.scimToServantErr)
+    -- Wrap all errors into the format required by SCIM, except for
+    -- 'CustomServant' errors because by now all SCIM errors have become
+    -- 'CustomServant' errors.
+    --
+    -- FIXME: this doesn't catch impure exceptions (e.g. 'error'). Doing it
+    -- properly is hard because 'hoistServer' doesn't allow natural
+    -- transformations to have additional constraints. Hopefully, SCIM
+    -- clients can handle non-SCIM-formatted errors with code 500 properly.
+    -- See <https://github.com/haskell-servant/servant/issues/1022>.
+    wrapScimErrors :: Spar a -> Spar a
+    wrapScimErrors = flip catchError $ \case
+        SAML.CustomServant x ->
+            throwError $ SAML.CustomServant x
+        e ->
+            throwError . SAML.CustomServant . Scim.scimToServantErr $
+            Scim.serverError (cs (errBody (sparToServantErr e)))
 
 ----------------------------------------------------------------------------
 -- UserDB
@@ -221,19 +240,9 @@ toScimEmail (Email eLocal eDomain) =
 
 -}
 
--- Note [error handling]
--- ~~~~~~~~~~~~~~~~~
---
--- There are two problems with error handling here:
---
--- 1. We want all errors originating from SCIM handlers to be thrown as SCIM
---    errors, not as Spar errors. Currently errors thrown from things like
---    'getTeamMembers' will look like Spar errors and won't be wrapped into
---    the 'ScimError' type. This might or might not be important, depending
---    on what is expected by apps that use the SCIM interface.
---
--- 2. We want generic error descriptions in response bodies, while still
---    logging nice error messages internally.
+-- FUTUREWORK: We want generic error descriptions in response bodies while
+-- still logging nice error messages internally. The current messages might
+-- be giving too many internal details away.
 
 instance Scim.UserDB Spar where
   -- | List all users, possibly filtered by some predicate.
