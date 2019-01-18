@@ -43,12 +43,11 @@ import Brig.Types.User       as Brig
 import Galley.Types.Teams    as Galley
 import Control.Monad.Except
 import Control.Monad.Catch
-import Control.Exception
 import Control.Lens hiding ((.=), Strict)
 import Data.Id
 import Data.Range
 import Servant
-import Spar.App (Spar, wrapMonadClient, sparCtxOpts, createUser)
+import Spar.App (Spar(..), Env, wrapMonadClient, sparCtxOpts, createUser)
 import Spar.API.Util
 import Spar.Error
 import Spar.Types
@@ -109,26 +108,44 @@ apiScim = hoistScim (toServant (Scim.siteServer configuration))
   where
     hoistScim = hoistServer (Proxy @(Scim.SiteAPI ScimToken))
                             (wrapScimErrors . toSpar)
+
     -- Unwrap the 'ScimHandler'
     toSpar :: Scim.ScimHandler Spar a -> Spar a
     toSpar = Scim.fromScimHandler
              (throwError . SAML.CustomServant . Scim.scimToServantErr)
-    -- Wrap all errors into the format required by SCIM, except for
-    -- 'CustomServant' errors because by now all SCIM errors have become
-    -- 'CustomServant' errors.
+
+    -- Wrap all errors into the format required by SCIM.
     --
-    -- FIXME: this doesn't catch impure exceptions (e.g. 'error'). Doing it
-    -- properly is hard because 'hoistServer' doesn't allow natural
-    -- transformations to have additional constraints. Hopefully, SCIM
-    -- clients can handle non-SCIM-formatted errors with code 500 properly.
-    -- See <https://github.com/haskell-servant/servant/issues/1022>.
+    -- FIXME: this doesn't catch impure exceptions (e.g. thrown with 'error').
+    -- Let's hope that SCIM clients can handle non-SCIM-formatted errors
+    -- properly. See <https://github.com/haskell-servant/servant/issues/1022>
+    -- for why it's hard to catch impure ex
     wrapScimErrors :: Spar a -> Spar a
-    wrapScimErrors = flip catchError $ \case
-        SAML.CustomServant x ->
-            throwError $ SAML.CustomServant x
-        e ->
-            throwError . SAML.CustomServant . Scim.scimToServantErr $
-            Scim.serverError (cs (errBody (sparToServantErr e)))
+    wrapScimErrors = over (_Spar . mapped) $ \io ->
+        try @_ @SomeException io <&> \case
+            -- We caught an exception that's not a Spar exception. It should be
+            -- wrapped into SCIM.serverError and rethrown.
+            Left someException ->
+                Left . SAML.CustomServant . Scim.scimToServantErr $
+                Scim.serverError (cs (displayException someException))
+            -- We caught a 'CustomServant' exception. It should be left as-is
+            -- because by now all SCIM errors have become 'CustomServant' errors
+            -- (thanks to 'toSpar') and we don't want to wrap them *again*.
+            Right (Left (SAML.CustomServant x)) ->
+                Left (SAML.CustomServant x)
+            -- We caught some other Spar exception. It should be wrapped into
+            -- SCIM.serverError and rethrown.
+            Right (Left sparError) ->
+                Left . SAML.CustomServant . Scim.scimToServantErr $
+                Scim.serverError (cs (errBody (sparToServantErr sparError)))
+            -- No exceptions! Good.
+            Right (Right x) ->
+                Right x
+
+    -- This isomorphism unwraps the Spar stack (Spar . ReaderT . ExceptT) into a
+    -- newtype-less form that's easier to work with.
+    _Spar :: Iso' (Spar a) (Env -> IO (Either SparError a))
+    _Spar = coerced
 
 ----------------------------------------------------------------------------
 -- UserDB
